@@ -1,0 +1,58 @@
+const {test,after}=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),os=require('node:os');
+const dir=fs.mkdtempSync(path.join(os.tmpdir(),'hireme-test-'));process.env.DATABASE_PATH=path.join(dir,'test.sqlite');process.env.UPLOAD_DIR=path.join(dir,'uploads');process.env.SEED_DEMO='true';
+// Tests use an isolated SQLite database and the local reset-token flow.
+process.env.SUPABASE_URL='';process.env.SUPABASE_ANON_KEY='';process.env.SUPABASE_SERVICE_ROLE_KEY='';
+const app=require('../server'),db=require('../db'),server=app.listen(0,'127.0.0.1');
+const ready=new Promise(resolve=>server.on('listening',resolve));
+async function request(url,method='GET',body,cookie=''){await ready;const response=await fetch(`http://127.0.0.1:${server.address().port}${url}`,{method,headers:{...(body instanceof FormData?{}:{'Content-Type':'application/json'}),cookie},body:body===undefined?undefined:body instanceof FormData?body:JSON.stringify(body)});return {status:response.status,body:await response.json(),cookie:response.headers.get('set-cookie')?.split(';')[0]}}
+async function register(name,role='employee'){const r=await request('/api/auth/register','POST',{name,email:name+'@example.test',password:'Testing123!',role});assert.equal(r.status,200);return r}
+test('candidate and recruiter flows, persisted scores, authorization and privacy',async()=>{
+ assert.equal((await request('/api/me')).status,401);
+ const c=await register('Candidate'),other=await register('Other'),r=await register('Recruiter','employer'),r2=await register('Recruiter2','employer');
+ const forgot=await request('/api/auth/forgot-password','POST',{email:'Other@example.test'});assert.equal(forgot.status,200);assert.ok(forgot.body.reset_token);assert.equal((await request('/api/auth/reset-password','POST',{token:forgot.body.reset_token,password:'NewTesting123!'})).status,200);const otherLogin=await request('/api/auth/login','POST',{email:'Other@example.test',password:'NewTesting123!'});assert.equal(otherLogin.status,200);other.cookie=otherLogin.cookie;assert.equal((await request('/api/auth/forgot-password','POST',{email:'unknown@example.test'})).body.reset_token,undefined);
+ assert.equal((await request('/api/auth/login','POST',{email:'Candidate@example.test',password:'wrong'})).status,401);
+ const login=await request('/api/auth/login','POST',{email:'Candidate@example.test',password:'Testing123!'});assert.equal(login.status,200);
+ const changed=await request('/api/profile','PUT',{education:'B.Tech',phone:'private-phone',target_role:'Data Analyst'},c.cookie);assert.equal(changed.body.user.education,'B.Tech');assert.equal(changed.body.user.id,c.body.user.id);
+ assert.equal((await request('/api/skills','POST',{name:'Python'},c.cookie)).status,201);
+ const p=await request('/api/projects','POST',{title:'Test project',description:'Build an API',skills:['Python']},c.cookie);assert.equal(p.status,201);
+ assert.equal((await request('/api/projects','GET',undefined,other.cookie)).body.length,0);
+ const record=await request('/api/evidence-records','POST',{title:'Private education',type:'education',visibility:'PRIVATE'},c.cookie);assert.equal(record.status,201);
+ assert.equal((await request('/api/evidence-records/'+record.body.id,'GET',undefined,other.cookie)).status,404);
+ const criteria=[{skill:'Python',weight:100,importance:'required',minimum_score:5}];
+ const role={title:'Backend intern',type:'internship',description:'Build a real API',location:'Remote',skills:criteria};
+ assert.equal((await request('/api/employer/opportunities','POST',role,c.cookie)).status,403);
+ const job=await request('/api/employer/opportunities','POST',role,r.cookie);assert.equal(job.status,201);
+ assert.equal((await request('/api/employer/opportunities/'+job.body.id,'PUT',{...role,title:'Updated intern'},r.cookie)).status,200);
+ assert.equal((await request('/api/employer/opportunities/'+job.body.id,'PUT',role,r2.cookie)).status,404);
+ assert.equal((await request('/api/employer/candidates?opportunity_id='+job.body.id,'GET',undefined,r2.cookie)).status,404);
+ const detail=await request('/api/opportunities/'+job.body.id,'GET',undefined,c.cookie);assert.equal(detail.body.match_score,5);assert.equal(detail.body.eligible,true);
+ const application=await request('/api/applications','POST',{opportunity_id:job.body.id,cover_letter:'My project is relevant'},c.cookie);assert.equal(application.status,201);assert.equal(application.body.score_snapshot.match_score,5);
+ assert.equal((await request('/api/applications','POST',{opportunity_id:job.body.id},c.cookie)).status,409);
+ assert.equal((await request('/api/applications','POST',{opportunity_id:job.body.id},r.cookie)).status,403);
+ assert.equal((await request('/api/employer/applications','GET',undefined,r.cookie)).body.length,1);
+ assert.equal((await request('/api/employer/applications/'+application.body.id,'PATCH',{status:'shortlisted'},r2.cookie)).status,404);
+ assert.equal((await request('/api/employer/applications/'+application.body.id,'PATCH',{status:'shortlisted'},r.cookie)).status,200);
+ assert.equal((await request('/api/applications','GET',undefined,c.cookie)).body[0].status,'shortlisted');
+ const candidate=await request('/api/employer/candidates/'+c.body.user.id,'GET',undefined,r.cookie);assert.equal(candidate.body.candidate.phone,undefined);assert.equal(candidate.body.candidate.password_hash,undefined);assert.equal(candidate.body.records.length,0);
+ const fd=new FormData();fd.append('evidence',new Blob(['Python project evidence'],{type:'text/plain'}),'project.txt');fd.append('type','project');fd.append('skill','Python');
+ const ev=await request('/api/evidence','POST',fd,c.cookie);assert.equal(ev.status,200);assert.equal(ev.body.evidence.verified,true);assert.equal(ev.body.evidence.points,20);assert.equal(ev.body.evidence.status,'auto_verified');
+ assert.equal((await request('/api/evidence','POST',fd,c.cookie)).status,409);
+ assert.equal((await request('/api/files/evidence/'+ev.body.evidence.id,'GET',undefined,other.cookie)).status,404);
+ assert.equal((await request('/api/employer/evidence/'+ev.body.evidence.id+'/review','POST',{status:'approved'},r.cookie)).status,410);
+ const resume=new FormData();resume.append('evidence',new Blob(['Skills\nPython\nReact\nSQL\n\nSelected Projects\nAnalytics dashboard\nBuilt a dashboard with React and SQL.\n\nExperience\nData intern\nWorked with Python data pipelines.\n\nEducation\nB.Tech Computer Science'],{type:'text/plain'}),'resume.txt');resume.append('type','resume');const parsed=await request('/api/resume','POST',resume,c.cookie);assert.equal(parsed.status,201);assert.deepEqual(parsed.body.detected_skills.sort(),['Python','React','SQL'].sort());assert.equal(parsed.body.auto_verified,true);assert.ok(parsed.body.evidence.length>=3);assert.ok(parsed.body.evidence.filter(x=>x.type==='resume_skill').every(x=>x.points===10&&x.status==='auto_verified'));assert.ok(parsed.body.evidence.some(x=>x.type==='project'&&x.points===20));assert.ok(parsed.body.extracted_records.length>=3);assert.ok(parsed.body.extracted_records.some(x=>x.type==='project'&&x.title==='Analytics dashboard'));assert.ok(db.filter('candidate_records',x=>x.user_id===c.body.user.id&&x.source==='resume_extraction').length>=3);
+ assert.equal((await request('/api/opportunities/'+job.body.id,'GET',undefined,c.cookie)).body.match_score,35);
+ assert.equal((await request('/api/applications','GET',undefined,c.cookie)).body[0].score_snapshot.match_score,5);
+ const tests=await request('/api/assessments/seed','POST',{},c.cookie);assert.equal(tests.body[0].questions[0].a,undefined);
+ const attempt=await request('/api/tests/'+tests.body[0].id+'/attempt','POST',{answers:[2,1,1]},c.cookie);assert.equal(attempt.body.score,100);
+ assert.equal((await request('/api/tests/'+tests.body[0].id,'GET',undefined,c.cookie)).body.questions[0].a,undefined);
+ await request('/api/tests/'+tests.body[0].id+'/attempt','POST',{answers:[null,null,null]},c.cookie);
+ assert.equal((await request('/api/skills','GET',undefined,c.cookie)).body.find(s=>s.skill.name==='Python').score,55);
+ assert.equal((await request('/api/saved/'+job.body.id,'POST',{},c.cookie)).body.saved,true);
+ assert.deepEqual((await request('/api/saved','GET',undefined,c.cookie)).body,[job.body.id]);
+ assert.equal(db.data.match_scores.length,1);assert.equal(db.data.match_scores[0].final_score,5);
+ const {DatabaseSync}=require('node:sqlite');const check=new DatabaseSync(process.env.DATABASE_PATH);assert.equal(check.prepare('SELECT count(*) n FROM applications').get().n,1);assert.equal(check.prepare('PRAGMA integrity_check').get().integrity_check,'ok');check.close();
+ await request('/api/auth/logout','POST',{},c.cookie);assert.equal((await request('/api/me','GET',undefined,c.cookie)).status,401);
+ assert.equal((await request('/api/employer/opportunities/'+job.body.id,'DELETE',undefined,r.cookie)).status,200);
+ assert.equal((await request('/api/employer/applications','GET',undefined,r.cookie)).body.length,1);
+});
+after(async()=>{await new Promise(resolve=>server.close(resolve));require('../lib/storage').sql.close();fs.rmSync(dir,{recursive:true,force:true})});
