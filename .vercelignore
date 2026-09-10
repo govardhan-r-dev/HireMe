@@ -1,0 +1,7 @@
+.env
+.env.*
+data/
+work/
+node_modules/
+.git/
+*.sqlite*
